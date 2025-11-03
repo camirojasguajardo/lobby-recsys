@@ -210,3 +210,6 @@ __marimo__/
 /output/
 /data/
 
+# Embedings
+src/state_of_art_models/emb_detalle/
+src/state_of_art_models/emb_temas
