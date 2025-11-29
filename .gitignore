@@ -216,5 +216,5 @@ __marimo__/
 src/state_of_art_models/emb_detalle/
 src/state_of_art_models/emb_temas
 
-.parquet/
-.npy/
+*.parquet
+*.npy
