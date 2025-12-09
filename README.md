@@ -1,87 +1,102 @@
-## 📘 Descripción general
+# 🏛️ LOBBY-RECSYS  
+### Sistema de recomendación para la Ley de Lobby (Chile)
 
-Un sistema de recomendación que busca facilitar la participación ciudadana en el marco de la **Ley N° 20.730**, ayudando a identificar qué autoridades (*sujetos pasivos*) son más pertinentes según el perfil y los intereses temáticos de quienes solicitan audiencias (*sujetos activos*).
+Este repositorio implementa un sistema de recomendación diseñado para facilitar la participación ciudadana bajo la **Ley N° 20.730**, ayudando a identificar qué autoridades públicas (*sujetos pasivos*) son pertinentes según los intereses temáticos y el historial de los solicitantes (*sujetos activos*).
 
-El sistema combina enfoques **híbridos** (basados en contenido y feedback implícito) y **basados en grafos**, para generar recomendaciones informadas y coherentes con las competencias institucionales.
+El sistema combina técnicas de **representación semántica**, **recomendación colaborativa**, **clustering temático** y **grafos neuronales**, con el fin de capturar afinidad temática en un dominio caracterizado por esparsidad extrema, arranque en frío (*cold-start*) y fuerte sesgo de popularidad.
 
 ---
 
-## 🧩 Estructura del repositorio
+## 📁 Estructura del repositorio
 
+```
 LOBBY-RECSYS/
 │
-├── data/ # Datos base extraídos desde leylobby.gob.cl
-│ ├── active_subjects.csv
-│ ├── passive_subjects.csv
-│ ├── audiencies.csv
-│ ├── institutions.csv
-│ └── materias_embeddings.parquet
+├── data/                     # Datos en https://drive.google.com/drive/folders/1RF51mMLP0NgEeuKdd9ZT0fuUHAM8tK0Y?usp=share_link
 │
-├── output/ # Resultados y modelos entrenados
-│ ├── recs_top20.csv / .json
-│ └── lightGCN/
-│ ├── models/
-│ ├── recommendations_top10/
-│ └── training_log/
+├── src/
 │
-├── src/ # Código fuente principal
-│ ├── scrapping/ # Extracción desde el portal de lobby
-│ └── state_of_art_models/
-│ ├── lightFM.ipynb
-│ ├── lightGCN.ipynb
-│ ├── lightGCN_base.py
-│ └── evaluation.py / metrics.py
+├── baselines/                 
+│   ├── ItemKNN.ipynb          # Implementación y evaluación del modelo Item-KNN
+│   ├── UserKNN.ipynb          # Implementación y evaluación del modelo User-KNN
+│   └── ALS.ipynb              # Factorización Matricial (ALS) para feedback implícito
+│   # → Contiene los modelos de referencia que sirven como línea base comparativa.
 │
-├── data_loading.ipynb # Limpieza y preprocesamiento
-├── data_analysis.ipynb # Análisis exploratorio
-├── text.ipynb # Generación de embeddings semánticos
+├── scrapping/
+│   └── ...                    # Scripts para extraer audiencias desde leylobby.gob.cl
+│   # → Automatiza la descarga, limpieza inicial y estructuración de las audiencias.
+│
+├── state_of_art_models/
+│   ├── content_bert.ipynb         # Generación de embeddings con SBERT
+│   ├── semantic_clustering.ipynb  # Pipeline completo de clustering (HDBSCAN + KMeans)
+│   ├── lightGCN_base.py           # Implementación modular del modelo LightGCN
+│   ├── lightGCN.ipynb             # Entrenamiento del LightGCN base sobre el dataset completo
+│   ├── tripartite_lightGCN.py     # Versión ampliada del modelo con nodos temáticos
+│   ├── tripartite_lightGCN.ipynb  # Entrenamiento end-to-end del modelo tripartito
+│   ├── ItemKNN.ipynb              # Entrenamiento y validación del modelo Item-KNN
+│   └── userKNN.ipynb              # Entrenamiento y validación del modelo User-KNN
+│   # → Contiene notebooks experimentales y versiones modulares de los modelos SOTA.
+│   #   Aquí se ejecutan los entrenamientos principales del proyecto.
+│
+├── evaluation.py               # Funciones estandarizadas para evaluación (Recall, MAP, nDCG)
+├── metrics.py                  # Implementación detallada de métricas top-k y medidas de equidad (Gini)
+├── utils.py                    # Utilidades generales: carga de datos, manipulación de grafos, helpers
+│
+├── data_loading.ipynb        # Limpieza y estructura del dataset
+├── data_analysis.ipynb       # Exploración y estadísticas descriptivas
+├── text.ipynb                # Generación de embeddings SBERT
+├── lightfm.ipynb             # Implementación LightFM (WARP)
+├── lightGCN.ipynb            # Entrenamiento LightGCN completo
+├── tripartite_lightGCN.ipynb # Experimentos del modelo tripartito
+│
+├── LICENSE
 └── README.md
-
-
----
-
-## ⚙️ Modelos implementados
-
-### 🔹 LightFM — Híbrido basado en contenido
-- Combina interacciones históricas con *embeddings* semánticos derivados de las materias tratadas.  
-- Embeddings generados con `sentence-transformers/distiluse-base-multilingual-cased-v2` (384 dims).  
-- **Loss:** WARP  
-- **Métricas:** Precision@10, AUC  
-- Exploración futura: uso de **DeepFM** para modelar interacciones no lineales y mejorar la precisión top-k.  
+```
 
 ---
 
-### 🔹 LightGCN — Basado en grafos
-- Modelo bipartito de sujetos activos ↔ pasivos, entrenado con pérdida **BPR**.  
-- **300 épocas**, **64 dimensiones**, **3 capas de propagación**.  
-- Convergencia estable: *nDCG@10 ≈ 0.047*, *Recall@10 ≈ 0.024*.  
-- Extensión propuesta: **LightGCN Tripartito**, incorporando nodos temáticos inicializados con embeddings semánticos.  
+## 🧠 Metodología y componentes principales
+
+### 1) **Embeddings semánticos**
+Los textos del campo *detalle* son representados mediante:
+
+- `distiluse-base-multilingual-cased-v2`
+- Reducción de dimensionalidad con **PCA**
+- Normalización previa al clustering y uso en modelos
+
+Estos embeddings permiten capturar afinidad temática sin depender de coincidencias literales entre palabras.
 
 ---
 
-### 🔹 2-Stage (Clustering + Light/DeepFM)
-Estrategia jerárquica:
-1. Agrupamiento semántico de autoridades (clustering de embeddings).  
-2. Re-ranking supervisado con LightFM o DeepFM.  
+### 2) **Clustering Temático (Híbrido: HDBSCAN + K-Means)**
 
-Permite reducir el espacio de búsqueda, mejorar la precisión local y mitigar el problema de *cold-start*.  
+Dado que los textos son breves y dispersos, se utiliza un enfoque de dos etapas:
 
----
+1. **HDBSCAN** para identificar núcleos densos y coherentes.
+2. **MiniBatch K-Means** para recuperar el resto del corpus (outliers).
 
-## 🚀 Próximos pasos
-
-- Implementar **DeepFM** con variables semánticas e institucionales mixtas.  
-- Desarrollar **LightGCN Tripartito** con nodos temáticos.  
-- Evaluar comparativamente Recall@k, nDCG@k y MAP.  
-- Elaborar el **póster y artículo final** del proyecto.
+El resultado final agrupa más de **2.000 temas latentes**, posteriormente utilizados para construir perfiles semánticos de usuarios y autoridades.
 
 ---
 
-## 📚 Referencias
+### 3) **Modelos de recomendación implementados**
 
-- He et al. (2020). *LightGCN: Simplifying and Powering Graph Convolution Network for Recommendation.*  
-- Guo et al. (2017). *DeepFM: A Factorization-Machine based Neural Network for CTR Prediction.*  
-- Rendle (2010). *Factorization Machines.*  
-- Reimers & Gurevych (2019). *Sentence-Transformers.*  
+#### 🔹 *Baselines*  
+- **Item-KNN**, **User-KNN**, **ALS**  
+- Permiten evaluar el aporte incremental de los modelos avanzados.  
 
----
+#### 🔹 **LightFM (WARP)**  
+- Combina señales colaborativas + embeddings semánticos.  
+- Ideal para escenarios con texto altamente informativo.
+
+#### 🔹 **LightGCN (Base)**  
+- Modelo de grafos bipartito Usuario–Autoridad.  
+- Entrenamiento con pérdida **BPR**.
+
+#### 🔹 **LightGCN Tripartito (Propuesto)**  
+- Extiende el grafo incorporando nodos temáticos.  
+- Permite integrar estructura colaborativa + semántica.  
+
+#### 🔹 **Clustering Semántico como Recomendador**  
+- Estrategia basada únicamente en similitud coseno entre embeddings.  
+- En evaluaciones internas obtuvo el **mejor recall y nDCG** del conjunto.

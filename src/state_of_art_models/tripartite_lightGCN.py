@@ -1,7 +1,16 @@
 # -*- coding: utf-8 -*-
-# LightGCN "puro" (BPR) para usar directamente desde un cuaderno con DataFrames
+"""
+LightGCN tripartito (usuarios, items, temas) con BPR,
+para usar directamente desde un cuaderno con DataFrames.
 
-import math, random
+Requiere:
+- interactions_df: columnas [user_id, item_id, timestamp]
+- item_topics_df: columnas [item_id, topic_id]
+- topics_df: columnas [topic_id, embedding]  (embedding = np.ndarray 1D)
+"""
+
+import math
+import random
 from collections import defaultdict
 from typing import Dict, Iterable, Tuple, Optional, List
 
@@ -37,11 +46,12 @@ def average_precision_at_k(rel, k):
     return np.mean(precisions) if precisions else 0.0
 
 
-# ------------------------ Splits ------------------------
+# ------------------------ Splits temporales ------------------------
 def make_temporal_splits(df: pd.DataFrame) -> pd.DataFrame:
     """
     Recibe df con columnas: user_id, item_id, timestamp (datetime o str)
-    Devuelve el mismo df con columna 'split' en {train,val,test} usando leave-last-1 por usuario.
+    Devuelve el mismo df con columna 'split' en {train,val,test}
+    usando leave-last-1 por usuario (última = test, penúltima = val).
     """
     assert {"user_id", "item_id", "timestamp"}.issubset(df.columns)
     out = df.copy()
@@ -56,24 +66,47 @@ def make_temporal_splits(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([train, val, last], ignore_index=True)
 
 
-# ------------------------ Grafo ------------------------
-def build_A_hat(n_users: int, n_items: int, ui_pairs: np.ndarray) -> torch.Tensor:
+# ------------------------ Grafo tripartito ------------------------
+def build_A_hat_tripartite(
+    n_users: int,
+    n_items: int,
+    n_topics: int,
+    ui_pairs: np.ndarray,
+    it_pairs: np.ndarray,
+) -> torch.Tensor:
     """
-    Construye Â = D^{-1/2} A D^{-1/2} como tensor disperso COO (cuda si disponible).
-    ui_pairs: array shape (E,2) de (u,i) solo de TRAIN (IDs 0-based).
+    Construye Â = D^{-1/2} A D^{-1/2} como tensor disperso COO (cuda/mps/cpu).
+
+    Nodos globales:
+      usuarios:   0 .. n_users-1
+      items:      n_users .. n_users+n_items-1
+      topics:     n_users+n_items .. n_users+n_items+n_topics-1
+
+    ui_pairs: (E_ui, 2)  -> (u, i)  con IDs 0-based
+    it_pairs: (E_it, 2)  -> (i, t)  con IDs 0-based
     """
     rows, cols = [], []
+
+    # 1) U - I edges (bipartito usuario-item)
     for u, i in ui_pairs:
-        rows.append(u)
-        cols.append(n_users + i)
-        rows.append(n_users + i)
-        cols.append(u)
+        u_g = int(u)
+        a_g = n_users + int(i)
+        rows.extend([u_g, a_g])
+        cols.extend([a_g, u_g])
+
+    # 2) I - T edges (item-topic)
+    for i, t in it_pairs:
+        a_g = n_users + int(i)
+        t_g = n_users + n_items + int(t)
+        rows.extend([a_g, t_g])
+        cols.extend([t_g, a_g])
 
     idx = torch.tensor([rows, cols], dtype=torch.long)
     vals = torch.ones(len(rows), dtype=torch.float32)
-    N = n_users + n_items
+    N = n_users + n_items + n_topics
     A = torch.sparse_coo_tensor(idx, vals, size=(N, N)).coalesce()
 
+    # normalización por grado: D^{-1/2} A D^{-1/2}
     deg = torch.sparse.sum(A, dim=1).to_dense()
     deg[deg == 0] = 1.0
     d_inv_sqrt = torch.pow(deg, -0.5)
@@ -86,33 +119,62 @@ def build_A_hat(n_users: int, n_items: int, ui_pairs: np.ndarray) -> torch.Tenso
     return A_hat
 
 
-# ------------------------ Modelo ------------------------
-class LightGCN(nn.Module):
+# ------------------------ Modelo tripartito ------------------------
+class TripartiteLightGCN(nn.Module):
     def __init__(
-        self, n_users: int, n_items: int, dim: int, n_layers: int, A_hat: torch.Tensor
+        self,
+        n_users: int,
+        n_items: int,
+        n_topics: int,
+        dim: int,
+        n_layers: int,
+        A_hat: torch.Tensor,
+        topic_init: Optional[torch.Tensor] = None,
     ):
+        """
+        n_users, n_items, n_topics: conteos
+        A_hat: matriz de adyacencia normalizada (sparse)
+        topic_init: tensor (n_topics, dim) con embeddings iniciales de temas (opcional)
+        """
         super().__init__()
         self.n_users = n_users
         self.n_items = n_items
-        self.history = []
+        self.n_topics = n_topics
+        self.N = n_users + n_items + n_topics
         self.dim = dim
         self.n_layers = n_layers
         self.A_hat = A_hat.coalesce()
 
-        self.user_emb = nn.Embedding(n_users, dim)
-        self.item_emb = nn.Embedding(n_items, dim)
-        nn.init.uniform_(self.user_emb.weight, a=-0.005, b=0.005)
-        nn.init.uniform_(self.item_emb.weight, a=-0.005, b=0.005)
+        # Embedding único para TODOS los nodos
+        self.node_emb = nn.Embedding(self.N, dim)
+        nn.init.uniform_(self.node_emb.weight, a=-0.005, b=0.005)
 
-    def propagate(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        E0 = torch.cat([self.user_emb.weight, self.item_emb.weight], dim=0)
-        outs = [E0]
-        E = E0
+        # Inicializar temas con embeddings semánticos, si se entregan
+        if topic_init is not None:
+            assert topic_init.shape == (n_topics, dim), (
+                f"topic_init debe ser de shape ({n_topics}, {dim}), "
+                f"pero es {topic_init.shape}"
+            )
+            with torch.no_grad():
+                start = n_users + n_items
+                self.node_emb.weight[start : start + n_topics].copy_(topic_init)
+
+    def propagate(self):
+        """
+        Propaga LightGCN sobre el grafo tripartito y retorna:
+          users_final, items_final, topics_final
+        """
+        E = self.node_emb.weight  # (N, dim)
+        outs = [E]
         for _ in range(self.n_layers):
             E = torch.sparse.mm(self.A_hat, E)
             outs.append(E)
         E_final = torch.stack(outs, dim=0).mean(dim=0)
-        return E_final[: self.n_users], E_final[self.n_users :]
+
+        users_final = E_final[: self.n_users]
+        items_final = E_final[self.n_users : self.n_users + self.n_items]
+        topics_final = E_final[self.n_users + self.n_items :]
+        return users_final, items_final, topics_final
 
     def forward(self):
         return self.propagate()
@@ -124,8 +186,11 @@ class LightGCN(nn.Module):
         users_final: Optional[torch.Tensor] = None,
         items_final: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        Score usuario-item: producto punto entre embeddings finales.
+        """
         if users_final is None or items_final is None:
-            users_final, items_final = self.propagate()
+            users_final, items_final, _ = self.propagate()
         return (users_final[user_ids] * items_final[item_ids]).sum(dim=1)
 
 
@@ -140,6 +205,9 @@ def to_user_pos_dict(pairs: np.ndarray) -> Dict[int, set]:
 def sample_bpr(
     tr_ui: Dict[int, set], n_items: int, n_samples: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Muestra (u, i_pos, i_neg) para BPR con negativos uniformes.
+    """
     users = list(tr_ui.keys())
     u_batch, ip_batch, in_batch = [], [], []
     for _ in range(n_samples):
@@ -158,7 +226,7 @@ def sample_bpr(
 
 @torch.no_grad()
 def evaluate_allranking(
-    model: LightGCN,
+    model: TripartiteLightGCN,
     tr_ui: Dict[int, set],
     te_ui: Dict[int, set],
     n_users: int,
@@ -166,8 +234,16 @@ def evaluate_allranking(
     ks: Iterable[int] = (10, 20),
     device: Optional[str] = None,
 ) -> Dict[str, float]:
+    """
+    Evalúa ranking usuario->items en conjunto de test (o val).
+    """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    users_f, items_f = model.propagate()
+    outs = model.propagate()
+    if len(outs) == 2:
+        users_f, items_f = outs
+    else:
+        users_f, items_f, _ = outs
+
     users_f = users_f.to(device)
     items_f = items_f.to(device)
 
@@ -200,8 +276,8 @@ def evaluate_allranking(
     return out
 
 
-# ------------------------ Runner para cuaderno ------------------------
-class LightGCNRunner:
+# ------------------------ Runner tripartito ------------------------
+class TripartiteLightGCNRunner:
     def __init__(
         self,
         dim: int = 64,
@@ -213,9 +289,18 @@ class LightGCNRunner:
         patience: int = 20,
         device: Optional[str] = None,
         seed: int = 42,
-        sample_frac: float = 1.0,  # 🔹 fracción de muestras BPR por época
-        val_metric: str = "nDCG@10",  # 🔹 métrica para early stopping
     ):
+        # device
+        if device is not None:
+            self.device = device
+        else:
+            if torch.backends.mps.is_available():
+                self.device = "mps"
+            elif torch.cuda.is_available():
+                self.device = "cuda"
+            else:
+                self.device = "cpu"
+
         self.dim = dim
         self.n_layers = n_layers
         self.lr = lr
@@ -223,48 +308,54 @@ class LightGCNRunner:
         self.batch_size = batch_size
         self.epochs = epochs
         self.patience = patience
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.seed = seed
-        self.sample_frac = sample_frac
-        self.val_metric = val_metric
 
         # artefactos
-        self.model: Optional[LightGCN] = None
+        self.model: Optional[TripartiteLightGCN] = None
         self.tr_ui: Optional[Dict[int, set]] = None
         self.va_ui: Optional[Dict[int, set]] = None
         self.te_ui: Optional[Dict[int, set]] = None
         self.n_users: Optional[int] = None
         self.n_items: Optional[int] = None
+        self.n_topics: Optional[int] = None
         self.best_state = None
 
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        if self.device == "cuda":
+        if self.device in ("cuda", "mps"):
             torch.cuda.manual_seed_all(seed)
 
     def _train_loop(
-        self, A_hat: torch.Tensor, tr_pairs: np.ndarray, va_pairs: np.ndarray
+        self,
+        A_hat: torch.Tensor,
     ):
-        self.model = LightGCN(
-            self.n_users, self.n_items, self.dim, self.n_layers, A_hat
+        self.model = TripartiteLightGCN(
+            self.n_users,
+            self.n_items,
+            self.n_topics,
+            self.dim,
+            self.n_layers,
+            A_hat,
+            topic_init=self.topic_init_tensor,
         ).to(self.device)
+
         opt = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=0.0)
 
         best_val = -1.0
         wait = 0
+        tr_pairs = np.array(
+            [(u, i) for u, items in self.tr_ui.items() for i in items],
+            dtype=np.int64,
+        )
+
         for epoch in range(1, self.epochs + 1):
             self.model.train()
-
-            # 🔹 número "target" de muestras BPR para esta época
-            total_pairs = len(tr_pairs)
-            epoch_pairs = int(total_pairs * self.sample_frac)
-            epoch_pairs = max(self.batch_size, epoch_pairs)  # al menos 1 batch
-            steps = math.ceil(epoch_pairs / self.batch_size)
-
+            n_pairs = max(len(tr_pairs), self.batch_size)
+            steps = math.ceil(n_pairs / self.batch_size)
             losses = []
 
-            for _ in range(steps):
+            for step in range(steps):
                 u, ip, ineg = sample_bpr(self.tr_ui, self.n_items, self.batch_size)
                 u, ip, ineg = (
                     u.to(self.device),
@@ -272,20 +363,26 @@ class LightGCNRunner:
                     ineg.to(self.device),
                 )
 
-                users_f, items_f = self.model.propagate()
+                users_f, items_f, topics_f = self.model.propagate()
 
                 x_pos = (users_f[u] * items_f[ip]).sum(dim=1)
                 x_neg = (users_f[u] * items_f[ineg]).sum(dim=1)
                 loss_bpr = -torch.log(torch.sigmoid(x_pos - x_neg) + 1e-12).mean()
+
+                # regularización L2 sobre embeddings de nodos usados (usuarios + items pos/neg)
+                u_glob = u
+                ip_glob = self.n_users + ip
+                in_glob = self.n_users + ineg
                 loss_reg = (
                     self.l2
                     * (
-                        self.model.user_emb(u).pow(2).sum()
-                        + self.model.item_emb(ip).pow(2).sum()
-                        + self.model.item_emb(ineg).pow(2).sum()
+                        self.model.node_emb(u_glob).pow(2).sum()
+                        + self.model.node_emb(ip_glob).pow(2).sum()
+                        + self.model.node_emb(in_glob).pow(2).sum()
                     )
                     / u.shape[0]
                 )
+
                 loss = loss_bpr + loss_reg
 
                 opt.zero_grad()
@@ -304,18 +401,10 @@ class LightGCNRunner:
                 ks=(10, 20),
                 device=self.device,
             )
-            val_ndcg10 = val_metrics["nDCG@10"]
-            val_rec10 = val_metrics["Recall@10"]
-            val_map10 = val_metrics["MAP@10"]
-
-            # métrica que se usa para early stopping
-            val_score = val_metrics.get(self.val_metric, val_ndcg10)
-
+            val_score = val_metrics["nDCG@10"]
             print(
-                f"Epoch {epoch:03d} | loss {np.mean(losses):.4f} "
-                f"| val Recall@10 {val_rec10:.4f} "
-                f"| val nDCG@10 {val_ndcg10:.4f} "
-                f"| val MAP@10 {val_map10:.4f}"
+                f"Epoch {epoch:03d} | loss {np.mean(losses):.4f} | "
+                f"val nDCG@10 {val_score:.4f}"
             )
 
             if val_score > best_val + 1e-5:
@@ -333,24 +422,32 @@ class LightGCNRunner:
         if self.best_state is not None:
             self.model.load_state_dict(self.best_state)
 
-    # -------- APIs públicas ----------
-    def fit(self, interactions_df: pd.DataFrame) -> Dict[str, float]:
+    # -------- API pública principal ----------
+    def fit(
+        self,
+        interactions_df: pd.DataFrame,
+        item_topics_df: pd.DataFrame,
+        topics_df: pd.DataFrame,
+    ) -> Dict[str, float]:
         """
-        Recibe df con columnas: user_id (int 0-based), item_id (int 0-based), timestamp
-        Hace split temporal y entrena. Retorna métricas de test.
+        Entrena el modelo tripartito.
+
+        interactions_df:
+            columnas: user_id (0-based), item_id (0-based), timestamp
+
+        item_topics_df:
+            columnas: item_id (0-based), topic_id (0-based)
+
+        topics_df:
+            columnas: topic_id (0-based), embedding (np.ndarray 1D de largo dim)
         """
+        # 1) Splits temporales U-I
         splits = make_temporal_splits(interactions_df)
         train_df = splits[splits.split == "train"][["user_id", "item_id"]]
         val_df = splits[splits.split == "val"][["user_id", "item_id"]]
         test_df = splits[splits.split == "test"][["user_id", "item_id"]]
-        return self.fit_with_splits(train_df, val_df, test_df)
 
-    def fit_with_splits(
-        self, train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame
-    ) -> Dict[str, float]:
-        """
-        Entrena usando DataFrames ya separados (columnas: user_id,item_id)
-        """
+        # 2) Conteos
         self.n_users = (
             int(
                 max(
@@ -371,7 +468,9 @@ class LightGCNRunner:
             )
             + 1
         )
+        self.n_topics = int(item_topics_df["topic_id"].max()) + 1
 
+        # 3) Pairs U-I (splits)
         tr_pairs = train_df[["user_id", "item_id"]].to_numpy(np.int64)
         va_pairs = val_df[["user_id", "item_id"]].to_numpy(np.int64)
         te_pairs = test_df[["user_id", "item_id"]].to_numpy(np.int64)
@@ -380,10 +479,32 @@ class LightGCNRunner:
         self.va_ui = to_user_pos_dict(va_pairs)
         self.te_ui = to_user_pos_dict(te_pairs)
 
-        A_hat = build_A_hat(self.n_users, self.n_items, tr_pairs).to(self.device)
-        self._train_loop(A_hat, tr_pairs, va_pairs)
+        # 4) Pairs I-T (a partir de item_topics_df)
+        it_pairs = (
+            item_topics_df[["item_id", "topic_id"]]
+            .dropna()
+            .drop_duplicates()
+            .to_numpy(np.int64)
+        )
 
-        # métricas test
+        # 5) topic_init desde topics_df
+        topics_sorted = topics_df.sort_values("topic_id")
+        topic_emb_list = topics_sorted["embedding"].values
+        topic_init = np.stack(topic_emb_list, axis=0).astype("float32")
+        assert (
+            topic_init.shape[0] == self.n_topics
+        ), f"n_topics={self.n_topics} pero topic_init tiene {topic_init.shape[0]} filas"
+        self.topic_init_tensor = torch.from_numpy(topic_init)
+
+        # 6) Construir A_hat tripartito
+        A_hat = build_A_hat_tripartite(
+            self.n_users, self.n_items, self.n_topics, tr_pairs, it_pairs
+        ).to(self.device)
+
+        # 7) Entrenar
+        self._train_loop(A_hat)
+
+        # 8) Métricas test
         self.model.eval()
         test_metrics = evaluate_allranking(
             self.model,
@@ -395,7 +516,8 @@ class LightGCNRunner:
             device=self.device,
         )
         print("== TEST ==")
-        [print(f"{k}: {v:.4f}") for k, v in test_metrics.items()]
+        for k, v in test_metrics.items():
+            print(f"{k}: {v:.4f}")
         return test_metrics
 
     @torch.no_grad()
@@ -404,10 +526,10 @@ class LightGCNRunner:
     ) -> List[int]:
         """
         Retorna lista de item_ids recomendados para user_id.
-        Requiere haber llamado fit/fit_with_splits.
+        Requiere haber llamado fit.
         """
         assert self.model is not None, "Entrena el modelo primero."
-        users_f, items_f = self.model.propagate()
+        users_f, items_f, topics_f = self.model.propagate()
         users_f = users_f.to(self.device)
         items_f = items_f.to(self.device)
 
